@@ -4,14 +4,14 @@ API that captures expert workflows, maps decisions and guardrails, and teaches n
 unseen cases. Implements the **Capture → Map → Teach** loop.
 
 > **Scope:** this repository is the **FastAPI backend**. The Next.js frontend lives in a separate
-> repository and is not present here; this API is the contract it builds against. The capture event
+> repository and present inside; this API is the contract it builds against. The capture event
 > schema it consumes is documented in `architecture.md`.
 
 ## Problem
 
 Expert tacit knowledge is undocumented and perishable. The person who knows why a cost center
 was chosen, when an invoice must be escalated, or which supplier history actually mattered is
-usually the only person who knows — and they are unavailable, or gone. New employees learn by
+usually the only person who knows and they are unavailable, or gone. New employees learn by
 shadowing, which is slow, inconsistent, and does not scale.
 
 The existing alternative is writing it down, which captures *procedure* but loses *judgment*:
