@@ -97,6 +97,7 @@ def test_llm_result_is_marked_as_such():
                     {
                         "question_type": "boundary",
                         "question": "What severity would keep this in tier2?",
+                        "evidence_quote": "escalated",
                         "trigger_event_id": None,
                         "rationale_for_internal_logging": "tier",
                     }

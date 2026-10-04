@@ -38,7 +38,31 @@ def _summarize_segments(segments: list[Any], limit: int = 6) -> list[dict[str, A
     ]
 
 
-def _validate_decide(raw: Any, events: list[Any]) -> dict[str, Any] | None:
+def _corpus(events: list[Any], segments: list[Any]) -> str:
+    """Everything the capture actually stated, as one searchable blob.
+
+    A generated question is only accepted when the evidence it cites appears here, which
+    is what stops the model inventing domain facts ("approved", "amount") that nobody
+    ever captured.
+    """
+    parts: list[str] = []
+    for event in events:
+        parts.append(_event_type(event))
+        parts.append(json.dumps(_event_data(event), default=str))
+    for seg in segments:
+        parts.append(getattr(seg, "text", "") or "")
+    return "\n".join(parts).lower()
+
+
+def _is_grounded(quote: Any, corpus: str) -> bool:
+    # Long enough that a token like "the" cannot pass as evidence, short enough that a
+    # real short phrase from the capture still counts.
+    if not isinstance(quote, str) or len(quote.strip()) < 8:
+        return False
+    return quote.strip().lower() in corpus
+
+
+def _validate_decide(raw: Any, events: list[Any], corpus: str = "") -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
     if raw.get("should_ask") is False:
@@ -55,6 +79,9 @@ def _validate_decide(raw: Any, events: list[Any]) -> dict[str, Any] | None:
     question = raw.get("question")
     if question_type not in QUESTION_TYPES or not isinstance(question, str) or not question.strip():
         return None
+    # Nothing captured means nothing to be curious about; stay silent rather than invent.
+    if not _is_grounded(raw.get("evidence_quote"), corpus):
+        return None
     event_ids = {getattr(event, "id", None) for event in events}
     trigger = raw.get("trigger_event_id")
     if trigger not in event_ids:
@@ -68,7 +95,7 @@ def _validate_decide(raw: Any, events: list[Any]) -> dict[str, Any] | None:
     }
 
 
-def _validate_debrief(raw: Any, events: list[Any], count: int) -> list[dict[str, Any]] | None:
+def _validate_debrief(raw: Any, events: list[Any], count: int, corpus: str = "") -> list[dict[str, Any]] | None:
     if isinstance(raw, dict):
         items = raw.get("questions")
     elif isinstance(raw, list):
@@ -88,6 +115,9 @@ def _validate_debrief(raw: Any, events: list[Any], count: int) -> list[dict[str,
         if question_type not in QUESTION_TYPES or question_type in seen_types:
             continue
         if not isinstance(question, str) or not question.strip():
+            continue
+        # A question the capture cannot back up is discarded, not softened.
+        if not _is_grounded(item.get("evidence_quote"), corpus):
             continue
         seen_types.add(question_type)
         trigger = item.get("trigger_event_id")
@@ -188,9 +218,12 @@ class QuestionPolicyService:
             "Ground every question in this specific workflow and the captured evidence. Use only vocabulary "
             "that appears in the evidence: never introduce a field, system, or concept the capture does not "
             "mention, and never reuse a generic template. "
+            'Copy an "evidence_quote" verbatim from the events or transcript that the question depends on. '
+            "If nothing in the capture supports a question, set should_ask to false instead of inventing one. "
             "Respond with strict JSON only, no prose, matching: "
             '{"should_ask": bool, "question_type": one of '
             '["rationale","boundary","guardrail","exception","alternative"], "question": string, '
+            '"evidence_quote": string, '
             '"trigger_event_id": string|null, "rationale_for_internal_logging": string}. '
             "Do not reveal internal reasoning to the user; put it only in rationale_for_internal_logging."
         )
@@ -205,7 +238,7 @@ class QuestionPolicyService:
             }
         )
         raw = self.llm.complete_json(system, user, max_tokens=400)
-        validated = _validate_decide(raw, events)
+        validated = _validate_decide(raw, events, _corpus(events, segments))
         self._used_llm = validated is not None
         return validated
 
@@ -227,9 +260,12 @@ class QuestionPolicyService:
             "Ground every question in this specific workflow and the evidence given. Use only vocabulary "
             "that appears in the evidence: never introduce a field, system, or concept the capture does not "
             "mention, and never reuse a generic template. "
+            "Each question must carry an \"evidence_quote\" copied verbatim from the events or transcript. "
+            "A question without a real quote is discarded, so never invent one. If the capture supports "
+            "fewer questions than requested, return fewer rather than inventing detail. "
             "Question types: rationale, boundary, guardrail, exception, alternative. "
             "Respond with strict JSON only, no prose, matching: "
-            '{"questions": [{"question_type": string, "question": string, '
+            '{"questions": [{"question_type": string, "question": string, "evidence_quote": string, '
             '"trigger_event_id": string|null, "rationale_for_internal_logging": string}]}.'
         )
         user = _json_block(
@@ -241,7 +277,7 @@ class QuestionPolicyService:
             }
         )
         raw = self.llm.complete_json(system, user, max_tokens=1024)
-        validated = _validate_debrief(raw, events, count)
+        validated = _validate_debrief(raw, events, count, _corpus(events, segments))
         self._used_llm = validated is not None
         return validated
 

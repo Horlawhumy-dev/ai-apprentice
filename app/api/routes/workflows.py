@@ -18,6 +18,19 @@ class StepUpdate(BaseModel):
     guardrails: list[dict] | None = None
 
 
+@router.get("/latest")
+def get_latest_workflow(db: Session = Depends(get_db)):
+    """The most recent work map from the user's own captures.
+
+    There is no seeded sample: this is real output, or a 404 when nothing is captured yet.
+    """
+    wm = WorkMapService(db)
+    wf = wm.latest_workflow()
+    if not wf:
+        raise HTTPException(status_code=404, detail="No work map captured yet")
+    return wm.to_response(wf)
+
+
 @router.get("/{workflow_id}")
 def get_workflow(workflow_id: str, db: Session = Depends(get_db)):
     wm = WorkMapService(db)
