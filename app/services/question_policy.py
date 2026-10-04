@@ -14,11 +14,6 @@ def _event_type(obj: Any) -> str:
     return getattr(obj, "type", "") or ""
 
 
-def _fmt_amount(value: Any) -> str:
-    if isinstance(value, (int, float)):
-        return f"{value:,.0f}" if float(value).is_integer() else f"{value:,.2f}"
-    return str(value)
-
 
 def _json_block(payload: Any) -> str:
     return json.dumps(payload, default=str)
@@ -117,6 +112,7 @@ class QuestionPolicyService:
             from app.services.llm import LLMClient
 
             self.llm = LLMClient()
+        self._used_llm = False
 
     def decide(
         self,
@@ -125,35 +121,51 @@ class QuestionPolicyService:
         questions_asked: int = 0,
         budget: int = 5,
         paused: bool = False,
+        workflow_title: str = "",
     ) -> dict[str, Any]:
+        result: dict[str, Any] | None = None
         if questions_asked < budget and (events or segments):
-            result = self._decide_llm(events, segments, questions_asked, budget, paused)
-            if result is not None:
-                return result
-        return self._decide_deterministic(events, segments, questions_asked, budget, paused)
+            result = self._decide_llm(events, segments, questions_asked, budget, paused, workflow_title)
+        if result is None:
+            result = self._decide_deterministic(
+                events, segments, questions_asked, budget, paused, workflow_title
+            )
+        result["source"] = "llm" if self._used_llm else "deterministic"
+        return result
 
-    def debrief(self, events: list[Any], segments: list[Any], count: int = 3) -> list[dict[str, Any]]:
-        llm_result = self._debrief_llm(events, segments, count) if (events or segments) else None
-        deterministic = self._debrief_deterministic(events, segments, count)
+    def debrief(
+        self,
+        events: list[Any],
+        segments: list[Any],
+        count: int = 3,
+        workflow_title: str = "",
+    ) -> list[dict[str, Any]]:
+        llm_result = self._debrief_llm(events, segments, count, workflow_title) if (events or segments) else None
+        deterministic = self._debrief_deterministic(events, segments, count, workflow_title)
+        used_llm = bool(llm_result)
         if not llm_result:
-            return deterministic
-        if len(llm_result) >= count:
-            return llm_result[:count]
-        merged = list(llm_result)
-        seen_types = {q["question_type"] for q in merged}
-        for question in deterministic:
-            if len(merged) >= count:
-                break
-            if question["question_type"] in seen_types:
-                continue
-            seen_types.add(question["question_type"])
-            merged.append(question)
-        for question in deterministic:
-            if len(merged) >= count:
-                break
-            if question not in merged:
+            merged = deterministic
+        elif len(llm_result) >= count:
+            merged = llm_result[:count]
+        else:
+            merged = list(llm_result)
+            seen_types = {q["question_type"] for q in merged}
+            for question in deterministic:
+                if len(merged) >= count:
+                    break
+                if question["question_type"] in seen_types:
+                    continue
+                seen_types.add(question["question_type"])
                 merged.append(question)
-        return merged[:count]
+            for question in deterministic:
+                if len(merged) >= count:
+                    break
+                if question not in merged:
+                    merged.append(question)
+            merged = merged[:count]
+        for question in merged:
+            question["source"] = "llm" if used_llm else "deterministic"
+        return merged
 
     def _decide_llm(
         self,
@@ -162,8 +174,10 @@ class QuestionPolicyService:
         questions_asked: int,
         budget: int,
         paused: bool,
+        workflow_title: str = "",
     ) -> dict[str, Any] | None:
         if not getattr(self.llm, "configured", False):
+            self._used_llm = False
             return None
         system = (
             "You are an expert interviewer observing someone perform a workflow. Stay silent during "
@@ -171,6 +185,9 @@ class QuestionPolicyService:
             "Question types: rationale (why did you change this), boundary (when would you not do this), "
             "guardrail (when should you stop and escalate), exception (what changes for this case), "
             "alternative (what if the value were different). "
+            "Ground every question in this specific workflow and the captured evidence. Use only vocabulary "
+            "that appears in the evidence: never introduce a field, system, or concept the capture does not "
+            "mention, and never reuse a generic template. "
             "Respond with strict JSON only, no prose, matching: "
             '{"should_ask": bool, "question_type": one of '
             '["rationale","boundary","guardrail","exception","alternative"], "question": string, '
@@ -179,6 +196,7 @@ class QuestionPolicyService:
         )
         user = _json_block(
             {
+                "workflow": workflow_title or "(unspecified)",
                 "questions_asked": questions_asked,
                 "question_budget": budget,
                 "session_paused": paused,
@@ -187,16 +205,28 @@ class QuestionPolicyService:
             }
         )
         raw = self.llm.complete_json(system, user, max_tokens=400)
-        return _validate_decide(raw, events)
+        validated = _validate_decide(raw, events)
+        self._used_llm = validated is not None
+        return validated
 
-    def _debrief_llm(self, events: list[Any], segments: list[Any], count: int) -> list[dict[str, Any]] | None:
+    def _debrief_llm(
+        self,
+        events: list[Any],
+        segments: list[Any],
+        count: int,
+        workflow_title: str = "",
+    ) -> list[dict[str, Any]] | None:
         if not getattr(self.llm, "configured", False):
+            self._used_llm = False
             return None
         system = (
             "You are an expert interviewer preparing a debrief. From the captured events and transcript, "
             "write follow-up questions that surface high-impact uncertainties or missing guardrails. "
             "Prefer questions about rationale for decisions, decision boundaries, exceptions, and "
             "when to stop or escalate. Avoid generic questions and avoid duplicates. "
+            "Ground every question in this specific workflow and the evidence given. Use only vocabulary "
+            "that appears in the evidence: never introduce a field, system, or concept the capture does not "
+            "mention, and never reuse a generic template. "
             "Question types: rationale, boundary, guardrail, exception, alternative. "
             "Respond with strict JSON only, no prose, matching: "
             '{"questions": [{"question_type": string, "question": string, '
@@ -204,13 +234,16 @@ class QuestionPolicyService:
         )
         user = _json_block(
             {
+                "workflow": workflow_title or "(unspecified)",
                 "requested_count": count,
                 "events": _summarize_events(events, limit=40),
                 "transcript": _summarize_segments(segments, limit=20),
             }
         )
         raw = self.llm.complete_json(system, user, max_tokens=1024)
-        return _validate_debrief(raw, events, count)
+        validated = _validate_debrief(raw, events, count)
+        self._used_llm = validated is not None
+        return validated
 
     def _decide_deterministic(
         self,
@@ -219,7 +252,9 @@ class QuestionPolicyService:
         questions_asked: int = 0,
         budget: int = 5,
         paused: bool = False,
+        workflow_title: str = "",
     ) -> dict[str, Any]:
+        self._used_llm = False
         if questions_asked >= budget:
             return {
                 "should_ask": False,
@@ -237,180 +272,128 @@ class QuestionPolicyService:
                 "rationale_for_internal_logging": "no_context",
             }
 
+        # Without a model there is no domain knowledge to draw on, so only what the
+        # capture itself states is safe to ask about. Anything else would assert facts
+        # about a workflow we have not seen.
         last_event = events[-1] if events else None
         if last_event is not None:
-            etype = _event_type(last_event)
-            data = _event_data(last_event)
-            if etype == "field_changed":
-                if data.get("field") == "cost_center":
-                    return {
-                        "should_ask": True,
-                        "question_type": "rationale",
-                        "question": f"Why did you set cost center to {data.get('new_value')} for this invoice?",
-                        "trigger_event_id": getattr(last_event, "id", None),
-                        "rationale_for_internal_logging": "cost_center_change",
-                    }
-                if data.get("field") in ("amount", "total"):
-                    return {
-                        "should_ask": True,
-                        "question_type": "boundary",
-                        "question": "When would an amount be small enough that you would not capitalize it?",
-                        "trigger_event_id": getattr(last_event, "id", None),
-                        "rationale_for_internal_logging": "amount_change",
-                    }
-            if etype == "asset_number_entered":
+            stated_reason = _event_data(last_event).get("reason")
+            if isinstance(stated_reason, str) and stated_reason.strip():
                 return {
                     "should_ask": True,
                     "question_type": "rationale",
-                    "question": "How did you decide this invoice needed an asset number?",
+                    "question": f"You recorded the reason \"{stated_reason.strip()}\". What drove that?",
                     "trigger_event_id": getattr(last_event, "id", None),
-                    "rationale_for_internal_logging": "asset_number_entered",
-                }
-            if etype == "supplier_history_viewed":
-                return {
-                    "should_ask": True,
-                    "question_type": "exception",
-                    "question": "What did the supplier history tell you, and what would change for a new supplier?",
-                    "trigger_event_id": getattr(last_event, "id", None),
-                    "rationale_for_internal_logging": "supplier_history_viewed",
-                }
-            if etype == "save_attempted":
-                return {
-                    "should_ask": True,
-                    "question_type": "guardrail",
-                    "question": "What conditions would require you to stop and escalate before saving?",
-                    "trigger_event_id": getattr(last_event, "id", None),
-                    "rationale_for_internal_logging": "save_attempt",
+                    "rationale_for_internal_logging": "stated_reason",
                 }
 
         for seg in reversed(segments):
-            text = (getattr(seg, "text", "") or "").lower()
-            if "threshold" in text:
+            text = (getattr(seg, "text", "") or "").strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            if any(word in lowered for word in ("escalat", "refer", "supervisor", "manager")):
+                return {
+                    "should_ask": True,
+                    "question_type": "guardrail",
+                    "question": f"You said \"{text}\" - what would you need in order to decide that on your own?",
+                    "trigger_event_id": None,
+                    "rationale_for_internal_logging": "referral_mentioned",
+                }
+            if any(word in lowered for word in ("threshold", "limit", "maximum", "minimum")):
                 return {
                     "should_ask": True,
                     "question_type": "boundary",
-                    "question": "When would an amount fall below this threshold and not be capitalized?",
+                    "question": f"You mentioned \"{text}\" - where exactly is that line, and what changes on either side of it?",
                     "trigger_event_id": None,
                     "rationale_for_internal_logging": "threshold_mentioned",
                 }
-            if "escalat" in text or "approval" in text:
-                return {
-                    "should_ask": True,
-                    "question_type": "guardrail",
-                    "question": "Who approves the escalation, and what evidence do they need?",
-                    "trigger_event_id": None,
-                    "rationale_for_internal_logging": "escalation_mentioned",
-                }
 
+        # No usable evidence for a single question type, but the workflow itself is
+        # known, so ask something grounded rather than staying silent or inventing
+        # domain details.
+        subject = workflow_title.strip() or "this step"
         return {
-            "should_ask": False,
+            "should_ask": True,
             "question_type": "rationale",
-            "question": "",
+            "question": f"Walk me through how you approach {subject}.",
             "trigger_event_id": None,
-            "rationale_for_internal_logging": "default",
+            "rationale_for_internal_logging": "workflow_walkthrough",
         }
 
     def _debrief_deterministic(
-        self, events: list[Any], segments: list[Any], count: int = 3
+        self,
+        events: list[Any],
+        segments: list[Any],
+        count: int = 3,
+        workflow_title: str = "",
     ) -> list[dict[str, Any]]:
-        amount: Any = None
-        supplier: Any = None
-        cost_center: Any = None
-        asset_number: Any = None
-        supplier_event = None
-        save_event = None
+        """Fallback debrief built only from what the capture itself states.
 
-        for ev in events:
-            etype = _event_type(ev)
-            data = _event_data(ev)
-            if etype == "invoice_opened":
-                amount = data.get("amount", amount)
-                supplier = data.get("supplier", supplier)
-            elif etype == "supplier_history_viewed":
-                supplier = data.get("supplier", supplier)
-                supplier_event = ev
-            elif etype == "field_changed":
-                if data.get("field") == "cost_center":
-                    cost_center = data.get("new_value", cost_center)
-            elif etype == "asset_number_entered":
-                asset_number = data.get("new_value", asset_number)
-            elif etype == "save_attempted":
-                save_event = ev
-                amount = data.get("amount", amount)
-                cost_center = data.get("cost_center", cost_center)
-                asset_number = data.get("asset_number", asset_number)
-
+        Every candidate is anchored to a recorded reason, decision, or piece of spoken
+        evidence, so no assumption is made about the business domain. When nothing was
+        captured the result is a single grounded prompt rather than invented filler.
+        """
         candidates: list[dict[str, Any]] = []
 
-        if save_event is not None:
-            candidates.append(
-                {
-                    "question_type": "guardrail",
-                    "question": "When this invoice is ready to save, what would make you stop and escalate to a human instead?",
-                    "trigger_event_id": getattr(save_event, "id", None),
-                    "rationale_for_internal_logging": "save_attempt_escalation",
-                }
-            )
-        if asset_number:
+        for ev in events:
+            data = _event_data(ev)
+            reason = data.get("reason")
+            decision = data.get("decision")
+            if not (isinstance(reason, str) and reason.strip()):
+                continue
+            step_id = getattr(ev, "id", None)
             candidates.append(
                 {
                     "question_type": "rationale",
-                    "question": f"You added asset number {asset_number}. How did you decide this invoice needed to be capitalized?",
-                    "trigger_event_id": None,
-                    "rationale_for_internal_logging": "asset_number_rationale",
+                    "question": f"You recorded \"{reason.strip()}\" - what evidence drove that, and what would have led you elsewhere?",
+                    "trigger_event_id": step_id,
+                    "rationale_for_internal_logging": f"stated_reason:{step_id}",
                 }
             )
-        if cost_center:
-            candidates.append(
-                {
-                    "question_type": "rationale",
-                    "question": f"You posted this invoice to cost center {cost_center}. What made that the right account rather than another one?",
-                    "trigger_event_id": None,
-                    "rationale_for_internal_logging": "cost_center_rationale",
-                }
-            )
-        if supplier:
+            if decision not in (None, ""):
+                candidates.append(
+                    {
+                        "question_type": "boundary",
+                        "question": f"You settled on \"{decision}\" here. At what point would you choose differently?",
+                        "trigger_event_id": step_id,
+                        "rationale_for_internal_logging": f"stated_decision:{step_id}",
+                    }
+                )
+            for rule in data.get("guardrails") or []:
+                if isinstance(rule, dict) and rule.get("rule"):
+                    candidates.append(
+                        {
+                            "question_type": "guardrail",
+                            "question": f"You noted the rule \"{rule['rule']}\" - when does it apply, and who checks it?",
+                            "trigger_event_id": step_id,
+                            "rationale_for_internal_logging": f"stated_guardrail:{step_id}",
+                        }
+                    )
+
+        for seg in segments:
+            text = (getattr(seg, "text", "") or "").strip()
+            if len(text) < 15:
+                continue
             candidates.append(
                 {
                     "question_type": "exception",
-                    "question": f"Your review of {supplier} shaped this decision. What changes if it is a brand-new supplier with no history?",
-                    "trigger_event_id": getattr(supplier_event, "id", None) if supplier_event else None,
-                    "rationale_for_internal_logging": "supplier_exception",
+                    "question": f"You said \"{text[:160]}\" - how often does that happen, and what do you do about it?",
+                    "trigger_event_id": None,
+                    "rationale_for_internal_logging": "transcript_claim",
                 }
             )
-        if amount is not None:
+
+        subject = workflow_title.strip() or "this workflow"
+        if not candidates:
             candidates.append(
                 {
-                    "question_type": "boundary",
-                    "question": f"This invoice is {_fmt_amount(amount)}. What is your capitalization threshold, and what would you do just below it?",
+                    "question_type": "rationale",
+                    "question": f"Nothing was captured to review yet. What is the first decision you would make during {subject}?",
                     "trigger_event_id": None,
-                    "rationale_for_internal_logging": "amount_boundary",
+                    "rationale_for_internal_logging": "empty_capture",
                 }
             )
-        candidates.append(
-            {
-                "question_type": "guardrail",
-                "question": "Which situations in this workflow must never be approved automatically?",
-                "trigger_event_id": None,
-                "rationale_for_internal_logging": "missing_guardrail",
-            }
-        )
-        candidates.append(
-            {
-                "question_type": "alternative",
-                "question": "If the amount were halved, would your process change, and how?",
-                "trigger_event_id": None,
-                "rationale_for_internal_logging": "alternative_amount",
-            }
-        )
-        candidates.append(
-            {
-                "question_type": "exception",
-                "question": "What is the most common exception you hit, and how do you resolve it?",
-                "trigger_event_id": None,
-                "rationale_for_internal_logging": "common_exception",
-            }
-        )
 
         seen_types: set[str] = set()
         result: list[dict[str, Any]] = []

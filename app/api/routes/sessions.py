@@ -1,10 +1,9 @@
-from datetime import datetime
-
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.time import epoch_ms, utcnow
 from app.db.connection import get_db
 from app.models import models
 from app.schemas.schemas import (
@@ -153,11 +152,18 @@ def decide_question(session_id: str, db: Session = Depends(get_db)):
     events = ev_svc.list_events(sess)
     segs = tr_svc.list_segments(sess)
     questions = db.query(models.Question).filter_by(session_id=sess.id).all()
-    res = pol.decide(list(events), list(segs), len(questions), budget=5, paused=(sess.status == "paused"))
+    res = pol.decide(
+        list(events),
+        list(segs),
+        len(questions),
+        budget=5,
+        paused=(sess.status == "paused"),
+        workflow_title=sess.workflow_title or "",
+    )
     if res.get("should_ask"):
         q = models.Question(
             session_id=sess.id,
-            timestamp_ms=int(datetime.utcnow().timestamp() * 1000),
+            timestamp_ms=epoch_ms(),
             question_type=res["question_type"],
             question_text=res["question"],
         )
@@ -170,6 +176,7 @@ def decide_question(session_id: str, db: Session = Depends(get_db)):
             "question_type": q.question_type,
             "question_text": q.question_text,
             "timestamp_ms": q.timestamp_ms,
+            "source": res.get("source", "deterministic"),
         }
     return res
 
@@ -204,12 +211,12 @@ def debrief(session_id: str, db: Session = Depends(get_db)):
     tr_svc = TranscriptService(db)
     events = ev_svc.list_events(sess)
     segs = tr_svc.list_segments(sess)
-    prompts = pol.debrief(list(events), list(segs), count=3)
+    prompts = pol.debrief(list(events), list(segs), count=3, workflow_title=sess.workflow_title or "")
     questions = []
     for i, prompt in enumerate(prompts):
         q = models.Question(
             session_id=sess.id,
-            timestamp_ms=int(datetime.utcnow().timestamp() * 1000) + i * 10,
+            timestamp_ms=epoch_ms() + i * 10,
             question_type=prompt.get("question_type", "rationale"),
             question_text=prompt.get("question") or "Tell me more about how you handle this step.",
         )
@@ -222,10 +229,15 @@ def debrief(session_id: str, db: Session = Depends(get_db)):
                 "question_type": q.question_type,
                 "question_text": q.question_text,
                 "trigger_event_id": prompt.get("trigger_event_id"),
+                "source": prompt.get("source", "deterministic"),
                 "timestamp_ms": q.timestamp_ms,
             }
         )
-    return {"session_id": sess.id, "questions": questions}
+    return {
+        "session_id": sess.id,
+        "questions": questions,
+        "source": questions[0].get("source") if questions else "deterministic",
+    }
 
 
 class AnswerPayload(BaseModel):
@@ -238,7 +250,7 @@ def answer_question(session_id: str, question_id: str, payload: AnswerPayload, d
     if not q or q.session_id != session_id:
         raise HTTPException(status_code=404, detail="Question not found")
     q.answer_text = payload.answer_text
-    q.answered_at = datetime.utcnow()
+    q.answered_at = utcnow()
     db.commit()
     db.refresh(q)
     return {

@@ -1,9 +1,8 @@
-from datetime import datetime
-
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.core.time import utcnow
 from app.db.connection import get_db
 from app.models import models
 from app.services.workmap_service import WorkMapService
@@ -37,7 +36,7 @@ def update_workflow(workflow_id: str, payload: dict, db: Session = Depends(get_d
     if payload.get("status") is not None:
         wf.status = payload["status"]
         if payload["status"] == "confirmed":
-            wf.confirmed_at = datetime.utcnow()
+            wf.confirmed_at = utcnow()
     db.commit()
     db.refresh(wf)
     return wm.to_response(wf)

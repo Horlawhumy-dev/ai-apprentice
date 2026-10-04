@@ -1,10 +1,10 @@
-from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.core.time import epoch_ms, utcnow
 from app.db.connection import get_db
 from app.models import models
 from app.services.case_service import CaseService
@@ -15,7 +15,8 @@ router = APIRouter(prefix="/apprentice", tags=["Apprentice"])
 
 class CreateApprenticeSessionRequest(BaseModel):
     workflow_id: str
-    case_id: str = "case_alpha"
+    case_id: str = "case"
+    case_data: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvaluateRequest(BaseModel):
@@ -24,16 +25,27 @@ class EvaluateRequest(BaseModel):
 
 
 @router.get("/cases")
-def list_cases():
-    return {"cases": CaseService().list_cases()}
+def list_cases(workflow_id: str | None = None, db: Session = Depends(get_db)):
+    """Cases actually in use, taken from apprentice sessions rather than a fixture."""
+    query = db.query(models.ApprenticeSession)
+    if workflow_id:
+        query = query.filter_by(workflow_id=workflow_id)
+    seen: set[str] = set()
+    cases: list[dict] = []
+    for session in query.all():
+        if session.case_id in seen:
+            continue
+        seen.add(session.case_id)
+        cases.append(CaseService.normalise(session.case_id, session.case_data or {}))
+    return {"cases": cases}
 
 
 @router.get("/cases/{case_id}")
-def get_case(case_id: str):
-    case = CaseService().get_case(case_id)
-    if not case:
+def get_case(case_id: str, db: Session = Depends(get_db)):
+    session = db.query(models.ApprenticeSession).filter_by(case_id=case_id).first()
+    if not session:
         raise HTTPException(status_code=404, detail="Case not found")
-    return case
+    return CaseService.normalise(session.case_id, session.case_data or {})
 
 
 @router.post("/sessions")
@@ -41,10 +53,13 @@ def create_apprentice_session(payload: CreateApprenticeSessionRequest, db: Sessi
     wf = db.get(models.Workflow, payload.workflow_id)
     if not wf:
         raise HTTPException(status_code=404, detail="Workflow not found")
-    case = CaseService().get_case(payload.case_id)
-    if not case:
-        raise HTTPException(status_code=404, detail="Case not found")
-    asess = models.ApprenticeSession(workflow_id=wf.id, case_id=payload.case_id, status="in_progress")
+    case = CaseService.normalise(payload.case_id, payload.case_data)
+    asess = models.ApprenticeSession(
+        workflow_id=wf.id,
+        case_id=payload.case_id,
+        case_data=payload.case_data,
+        status="in_progress",
+    )
     db.add(asess)
     db.commit()
     db.refresh(asess)
@@ -93,38 +108,39 @@ def evaluate(session_id: str, payload: EvaluateRequest, db: Session = Depends(ge
     if asess.status != "in_progress":
         raise HTTPException(status_code=400, detail="Session not in progress")
 
-    case = CaseService().get_case(asess.case_id) or {}
-    merged = {**case, **{k: v for k, v in payload.case_data.items() if v is not None}}
+    merged = {**(asess.case_data or {}), **{k: v for k, v in (payload.case_data or {}).items() if v is not None}}
+
+    # Guardrails are data captured for this specific workflow, not built into the code.
+    workflow_steps = (
+        db.query(models.WorkflowStep).filter_by(workflow_id=asess.workflow_id).all()
+    )
+    workflow_guardrails: list[dict] = []
+    for step in workflow_steps:
+        for rule in step.guardrails or []:
+            if isinstance(rule, dict):
+                workflow_guardrails.append({**rule, "_step_id": step.id})
 
     tutor = TutorService(db)
-    res = tutor.evaluate(payload.action, merged)
+    res = tutor.evaluate(payload.action, merged, workflow_guardrails)
 
-    evidence_step_id = res.get("evidence_step_id")
-    if evidence_step_id:
-        step = (
-            db.query(models.WorkflowStep)
-            .filter_by(workflow_id=asess.workflow_id, action=evidence_step_id)
-            .first()
+    result = {**res}
+    # Link a blocked action back to the step that actually defined the rule, so the
+    # apprentice can see the expert's own reasoning. The rule id is the reliable link;
+    # a step's `action` is frequently something else entirely.
+    matched_rule_id = res.get("matched_rule_id")
+    if matched_rule_id:
+        source = next(
+            (r for r in workflow_guardrails if r.get("rule_id") == matched_rule_id), None
         )
+        step = db.get(models.WorkflowStep, (source or {}).get("_step_id") or "")
         if step:
-            result = {
-                "allowed": res.get("allowed", True),
-                "matched_rule_id": res.get("matched_rule_id"),
-                "severity": res.get("severity", "info"),
-                "explanation": res.get("explanation", ""),
-                "evidence_step_id": step.id,
-                "evidence": {
-                    "action": step.action,
-                    "reason": step.reason,
-                    "timestamp_ms": step.timestamp_ms,
-                    "guardrails": step.guardrails,
-                },
-                "next_question": res.get("next_question"),
+            result["evidence_step_id"] = step.id
+            result["evidence"] = {
+                "action": step.action,
+                "reason": step.reason,
+                "timestamp_ms": step.timestamp_ms,
+                "guardrails": step.guardrails,
             }
-        else:
-            result = {**res}
-    else:
-        result = {**res}
 
     attempt = models.ApprenticeAttempt(
         apprentice_session_id=asess.id,
@@ -132,7 +148,7 @@ def evaluate(session_id: str, payload: EvaluateRequest, db: Session = Depends(ge
         evaluated_rule_id=res.get("matched_rule_id"),
         outcome="allowed" if res.get("allowed") else "blocked",
         feedback=res.get("explanation"),
-        timestamp_ms=int(datetime.utcnow().timestamp() * 1000),
+        timestamp_ms=epoch_ms(),
     )
     db.add(attempt)
     db.commit()
@@ -149,7 +165,7 @@ def finish_apprentice(session_id: str, db: Session = Depends(get_db)):
     if asess.status == "finished":
         return {"id": asess.id, "status": asess.status, "finished_at": asess.finished_at}
     asess.status = "finished"
-    asess.finished_at = datetime.utcnow()
+    asess.finished_at = utcnow()
     db.commit()
     db.refresh(asess)
     blocked = [a for a in asess.attempts if a.outcome == "blocked"]

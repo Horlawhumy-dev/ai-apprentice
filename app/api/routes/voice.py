@@ -10,9 +10,9 @@ router = APIRouter(prefix="/voice", tags=["Voice"])
 def voice_config():
     configured = voice_service.is_configured()
     return {
-        "provider": "elevenlabs" if configured else "prototype",
+        "provider": "elevenlabs",
         "configured": configured,
-        "mode": "signed_url" if configured else "manual_transcript",
+        "mode": "signed_url" if configured else "unavailable",
     }
 
 

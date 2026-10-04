@@ -1,9 +1,9 @@
-from datetime import datetime
 from typing import Literal
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.time import utcnow
 from app.models import models
 
 
@@ -47,7 +47,7 @@ class SessionService:
         if new_status not in transitions:
             raise HTTPException(status_code=400, detail=f"Invalid transition from {session.status} to {new_status}")
         session.status = new_status
-        now = datetime.utcnow()
+        now = utcnow()
         if new_status == "capturing" and not session.started_at:
             session.started_at = now
         if new_status == "finishing":
@@ -83,7 +83,7 @@ class SessionService:
 
     def mark_finished(self, session: models.Session) -> models.Session:
         session.status = "finished"
-        session.ended_at = session.ended_at or datetime.utcnow()
+        session.ended_at = session.ended_at or utcnow()
         self.db.commit()
         self.db.refresh(session)
         return session

@@ -6,14 +6,31 @@ from app.main import app
 
 client = TestClient(app)
 
+WORKFLOW = "Incident Triage"
 
-def _create_session():
-    res = client.post("/api/sessions", json={"workflow_title": "Invoice Processing", "expert_name": "Demo Expert"})
+
+def _create_session(title=WORKFLOW):
+    res = client.post("/api/sessions", json={"workflow_title": title, "expert_name": "Sam"})
     assert res.status_code == 200
     return res.json()["session_id"]
 
 
+def _event(etype, data, ts, source="ticketing_app"):
+    return {
+        "client_event_id": str(uuid4()),
+        "timestamp_ms": ts,
+        "source": source,
+        "type": etype,
+        "data": data,
+    }
+
+
 def test_full_capture_map_teach_loop():
+    """Capture -> Map -> Teach, driven entirely by the workflow's own data.
+
+    Nothing here depends on a built-in business domain: the guardrail is supplied by
+    the captured session and the case is supplied by the caller.
+    """
     sid = _create_session()
 
     res = client.post(f"/api/sessions/{sid}/start")
@@ -21,27 +38,26 @@ def test_full_capture_map_teach_loop():
     assert res.json()["status"] == "capturing"
 
     events = [
-        {
-            "client_event_id": str(uuid4()),
-            "timestamp_ms": 1000,
-            "source": "demo_erp",
-            "type": "invoice_opened",
-            "data": {"invoice_id": "INV-4471", "amount": 7200},
-        },
-        {
-            "client_event_id": str(uuid4()),
-            "timestamp_ms": 2000,
-            "source": "demo_erp",
-            "type": "field_changed",
-            "data": {"field": "cost_center", "old_value": "OPEX", "new_value": "CAPEX", "invoice_id": "INV-4471"},
-        },
-        {
-            "client_event_id": str(uuid4()),
-            "timestamp_ms": 3000,
-            "source": "demo_erp",
-            "type": "save_attempted",
-            "data": {"invoice_id": "INV-4471", "asset_number": ""},
-        },
+        _event("ticket_opened", {"ticket": "T-1", "severity": "high"}, 1000),
+        _event(
+            "field_changed",
+            {
+                "field": "queue",
+                "old_value": "tier1",
+                "new_value": "tier2",
+                "decision": "tier2",
+                "reason": "SLA for high severity is 15 minutes and tier1 was at capacity",
+                "guardrails": [
+                    {
+                        "rule_id": "require_owner",
+                        "rule": "Every reassignment needs a named owner",
+                        "severity": "block",
+                        "condition": {"requires_fields": ["owner"]},
+                    }
+                ],
+            },
+            2000,
+        ),
     ]
     for ev in events:
         assert client.post(f"/api/sessions/{sid}/events", json=ev).status_code == 200
@@ -55,13 +71,12 @@ def test_full_capture_map_teach_loop():
             "segment_id": str(uuid4()),
             "timestamp_ms": 2500,
             "speaker": "expert",
-            "text": "This equipment is above our capitalization threshold, so it needs an asset number.",
+            "text": "High severity goes straight to tier2 because tier1 was already at capacity.",
             "source": "voice_provider",
         },
     )
     assert res.status_code == 200
 
-    # decisions/questions
     res = client.post(f"/api/sessions/{sid}/questions/decide")
     assert res.status_code == 200
 
@@ -69,49 +84,62 @@ def test_full_capture_map_teach_loop():
     assert client.post(f"/api/sessions/{sid}/finish").json()["status"] == "finished"
     assert client.post(f"/api/sessions/{sid}/finish").json()["status"] == "finished"
 
-    # work map generation
     wm = client.post(f"/api/sessions/{sid}/work-map/generate").json()
     assert wm["status"] == "needs_expert_review"
-    actions = {s["action"] for s in wm["steps"]}
-    assert "change_cost_center" in actions
-    assert "require_asset_number" in actions
+    assert {s["action"] for s in wm["steps"]} >= {"ticket_opened", "change_queue"}
+    # Spoken reasoning is filed against the step the expert was on, not as its own
+    # step, so every action carries its own justification and rules.
+    assert not any(s["action"] == "transcript_note" for s in wm["steps"])
+    assert all(s["reason"] for s in wm["steps"]), "each step should carry the expert's reasoning"
 
-    guardrail_step = next(s for s in wm["steps"] if s["action"] == "require_asset_number")
-    assert guardrail_step["guardrails"][0]["rule_id"] == "require_asset_number"
-    assert guardrail_step["evidence"]["transcript_excerpts"], "guardrail step should link transcript evidence"
+    # The machine-checkable rule the expert attached to the event is carried onto its
+    # step. Spoken reasoning also becomes a rule (with a generated id), so select the
+    # structured one the event supplied.
+    guardrail_step = next(s for s in wm["steps"] if any("condition" in g for g in s["guardrails"]))
+    rule = next(g for g in guardrail_step["guardrails"] if "condition" in g)
+    assert rule["rule_id"] == "require_owner"
+    assert rule["condition"] == {"requires_fields": ["owner"]}
 
-    # expert confirms the workflow
+    # Prose rules captured from speech are addressable too, so a violation can always
+    # be traced back to the step that set the rule.
+    assert all(g.get("rule_id") for s in wm["steps"] for g in s["guardrails"])
+
     res = client.patch(f"/api/workflows/{wm['id']}", json={"status": "confirmed"})
     assert res.json()["status"] == "confirmed"
 
-    # confirm the guardrail step
     res = client.patch(
         f"/api/workflows/{wm['id']}/steps/{guardrail_step['id']}",
         json={"review_status": "confirmed"},
     )
     assert res.json()["review_status"] == "confirmed"
 
-    # apprentice uses a different case that exercises the same rule
-    res = client.post("/api/apprentice/sessions", json={"workflow_id": wm["id"], "case_id": "case_alpha"})
+    # the unseen case is supplied by the caller, not looked up
+    res = client.post(
+        "/api/apprentice/sessions",
+        json={
+            "workflow_id": wm["id"],
+            "case_id": "case_t2_backlog",
+            "case_data": {"ticket": "T-2", "severity": "high", "queue": "tier2"},
+        },
+    )
     assert res.status_code == 200
-    asess = res.json()
-    assert asess["case"]["title"] == "Invoice INV-5120"
-    aid = asess["id"]
+    aid = res.json()["id"]
+    assert res.json()["case"]["case_id"] == "case_t2_backlog"
+    assert res.json()["case"]["severity"] == "high"
 
-    # wrong: CAPEX above threshold with no asset number -> blocked with evidence link
+    # missing required owner -> blocked, linked back to the step that defined the rule
     blocked = client.post(
         f"/api/apprentice/sessions/{aid}/evaluate",
-        json={"action": "save_attempted", "case_data": {"asset_number": ""}},
+        json={"action": "change_queue", "case_data": {"owner": ""}},
     ).json()
     assert blocked["allowed"] is False
-    assert blocked["matched_rule_id"] == "require_asset_number"
-    assert blocked["evidence_step_id"] == guardrail_step["id"]
-    assert blocked["evidence"]["action"] == "require_asset_number"
+    assert blocked["matched_rule_id"] == "require_owner"
+    assert blocked["evidence"]["action"] == guardrail_step["action"]
 
-    # corrected: asset number supplied -> allowed
+    # owner supplied -> allowed
     allowed = client.post(
         f"/api/apprentice/sessions/{aid}/evaluate",
-        json={"action": "save_attempted", "case_data": {"asset_number": "A-1001"}},
+        json={"action": "change_queue", "case_data": {"owner": "dana"}},
     ).json()
     assert allowed["allowed"] is True
 
@@ -121,34 +149,37 @@ def test_full_capture_map_teach_loop():
     assert summary["summary"]["allowed"] == 1
 
 
+def test_workflow_without_guardrails_blocks_nothing():
+    """A workflow with no captured guardrails must not invent any."""
+    sid = _create_session("Fleet Telemetry Review")
+    client.post(f"/api/sessions/{sid}/start")
+    client.post(f"/api/sessions/{sid}/events", json=_event("ping", {}, 10))
+    client.post(f"/api/sessions/{sid}/finish")
+    wm = client.post(f"/api/sessions/{sid}/work-map/generate").json()
+
+    aid = client.post(
+        "/api/apprentice/sessions",
+        json={"workflow_id": wm["id"], "case_id": "c1", "case_data": {"x": 1}},
+    ).json()["id"]
+
+    res = client.post(
+        f"/api/apprentice/sessions/{aid}/evaluate",
+        json={"action": "anything", "case_data": {}},
+    ).json()
+    assert res["allowed"] is True
+    assert res["matched_rule_id"] is None
+
+
 def test_off_record_blocks_capture_and_excludes_events():
     sid = _create_session()
     client.post(f"/api/sessions/{sid}/start")
     client.post(f"/api/sessions/{sid}/off-record")
-    res = client.post(
-        f"/api/sessions/{sid}/events",
-        json={
-            "client_event_id": str(uuid4()),
-            "timestamp_ms": 10,
-            "source": "demo_erp",
-            "type": "field_changed",
-            "data": {},
-        },
-    )
+    res = client.post(f"/api/sessions/{sid}/events", json=_event("field_changed", {}, 10))
     assert res.status_code == 400
 
     # resume and add an on-record event
     client.post(f"/api/sessions/{sid}/resume")
-    client.post(
-        f"/api/sessions/{sid}/events",
-        json={
-            "client_event_id": str(uuid4()),
-            "timestamp_ms": 20,
-            "source": "demo_erp",
-            "type": "invoice_opened",
-            "data": {},
-        },
-    )
+    client.post(f"/api/sessions/{sid}/events", json=_event("ticket_opened", {}, 20))
     client.post(f"/api/sessions/{sid}/finish")
     wm = client.post(f"/api/sessions/{sid}/work-map/generate").json()
     client_ids = [e for s in wm["steps"] for e in s["evidence"].get("event_ids", [])]

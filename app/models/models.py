@@ -5,6 +5,7 @@ from uuid import uuid4
 from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Float, ForeignKey, String, Text, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.time import utcnow
 from app.db.connection import Base
 
 
@@ -21,7 +22,7 @@ class Session(Base):
     status: Mapped[str] = mapped_column(String(50), default="created")
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     events: Mapped[list["Event"]] = relationship("Event", back_populates="session")
     transcript_segments: Mapped[list["TranscriptSegment"]] = relationship(
@@ -87,7 +88,7 @@ class Workflow(Base):
     title: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(50), default="needs_expert_review")
     version: Mapped[int] = mapped_column(default=1)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     steps: Mapped[list["WorkflowStep"]] = relationship("WorkflowStep", back_populates="workflow")
@@ -117,8 +118,9 @@ class ApprenticeSession(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
     workflow_id: Mapped[str] = mapped_column(String(36), ForeignKey("workflows.id"))
     case_id: Mapped[str] = mapped_column(String(255))
+    case_data: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(50), default="in_progress")
-    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     attempts: Mapped[list["ApprenticeAttempt"]] = relationship(

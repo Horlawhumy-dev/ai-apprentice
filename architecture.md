@@ -17,7 +17,6 @@ Teach loop against the API directly, without a browser.
 Browser (Next.js App Router) — NOT PRESENT IN THIS REPO
 ├── /                 landing
 ├── /expert           Expert Capture (screen share, pause, off-record, finish, debrief)
-├── /demo-erp         Fictional invoice ERP that emits structured events
 ├── /work-map/[id]    Review timeline, edit/confirm/reject steps, confirm workflow
 └── /apprentice       Trainee case, deterministic guardrail evaluation, evidence link
               │ HTTPS JSON
@@ -26,7 +25,7 @@ FastAPI backend
 ├── /api/sessions        session lifecycle + events + transcript + questions + work-map
 ├── /api/workflows       workflow + step review/confirmation
 ├── /api/apprentice      case templates + evaluation + attempt history
-└── /api/voice           provider config (ElevenLabs if configured, else prototype transcript)
+└── /api/voice           provider config (ElevenLabs if configured, else unavailable)
               │
               ▼
 PostgreSQL (SQLAlchemy)
@@ -35,18 +34,18 @@ PostgreSQL (SQLAlchemy)
 ## Data flow
 
 1. **Capture** — The expert creates a session on `/expert` and shares the workspace with
-   `getDisplayMedia`. The source of structured events is either the built-in `/demo-erp` or a real
-   application instrumented with `public/sdk/ai-apprentice-capture.js`. Both post events
-   (`field_changed`, `click`, `decision`, `save_attempted`, `invoice_opened`, …) to
+   `getDisplayMedia`. Structured events come from a real application instrumented with
+   `public/sdk/ai-apprentice-capture.js`, which posts events
+   (`field_changed`, `click`, `decision`, `save_attempted`, …) to
    `/api/sessions/{id}/events`. `/expert` polls the session so events from a real app appear live.
 2. **Map** — After `finish`, the expert answers debrief questions. `/work-map/generate` time-orders
    events, transcript segments, and expert answers into `WorkflowStep` rows with evidence links,
    confidence, and proposed guardrails. The expert confirms/edits/rejects each step and confirms the
    workflow. Unconfirmed rules are clearly marked and never used to block trainee work.
-3. **Teach** — The trainee opens `/apprentice` with the confirmed `workflow_id`, receives a
-   *different* deterministic case (`case_alpha`), and each `save_attempted` is evaluated by the
-   deterministic guardrail engine. Blocking rules prevent the save, explain the rule, and link back
-   to the expert evidence step.
+3. **Teach** — The trainee opens `/apprentice`, supplies the confirmed `workflow_id` plus a case the
+   expert never saw (a `case_id` and a JSON body). The page derives its inputs from the work map's own
+   guardrails, and each submitted action is evaluated by `GuardrailService`. Blocking rules prevent the
+   action, explain the rule, and link back to the expert's own evidence step.
 
 ## Instrumenting a real system
 
@@ -73,9 +72,9 @@ rules directly. Auto-track maps clicks to `click`, input changes to `field_chang
 (`data.field`, `old_value`, `new_value`), and form submits to `save_attempted`. Password fields and
 elements marked `data-ai-apprentice-ignore` are never captured.
 
-The invoice-specific `require_asset_number` guardrail step is only generated when the session shows
-capitalization signals (a `cost_center` change or `asset_number_entered`), so real workflows are not
-polluted with demo rules.
+Rules are extracted from what the expert actually did: every `decision` and `save_attempted` event
+contributes its `reason` and any attached `guardrails[]` to the step it produced. Nothing is inferred
+from a built-in template.
 
 ## Session state machine
 
@@ -98,7 +97,7 @@ captured content. `finish` is idempotent.
 - Screen/audio capture begins only from an explicit user click and shows persistent status.
 - **Off Record** stops capture and causes the backend to reject subsequent events/transcript.
 - Provider secrets live only in backend environment variables; only `NEXT_PUBLIC_API_URL` is public.
-- Demo data (invoices, suppliers, employees) is synthetic.
+- Nothing is seeded or synthetic. Every work map comes from a real capture session.
 
 ## Provider integration
 
@@ -106,9 +105,8 @@ captured content. `finish` is idempotent.
   calls `POST /api/voice/token`, and the backend exchanges its API key for a short-lived signed
   WebSocket URL (valid ~15 minutes) via ElevenLabs' `get-signed-url`. The API key and the raw
   agent id never leave the server. When ElevenLabs is not configured, the endpoint returns `503`
-  and the UI runs in clearly-labelled prototype transcript mode so the rest of the loop stays
-  demonstrable. Transcript segments carry a constrained `source`
-  (`voice_provider` | `prototype_transcript`) so provenance stays queryable.
+  and the UI shows that it is unavailable rather than substituting fake audio. Transcript segments
+  carry a constrained `source` of `voice_provider`, so provenance stays queryable.
 - **Interviewer (LLM)**: `QuestionPolicyService` is model-driven when `LLM_API_KEY` is set. It sends
   recent events + transcript + session state + remaining budget to the Anthropic Messages API and
   expects a validated `{should_ask, question_type, question, trigger_event_id, rationale_for_internal_logging}`
@@ -117,15 +115,19 @@ captured content. `finish` is idempotent.
   deterministic policy runs alone, so behavior is predictable offline. Model/base URL come from
   `LLM_MODEL` / `LLM_BASE_URL`.
 - **Vision**: `VisionService` is an optional corroboration layer and is not required for the loop.
-  Structured demo ERP events are the source of truth.
+  Structured events from instrumented applications are the source of truth.
 
 ## Guardrails
 
-The demo guardrails are deterministic and live in `app/services/guardrails.py`:
+Guardrails are not built in. Each rule is a `guardrails[]` entry the expert attached to a captured
+step, evaluated by `GuardrailService`. Evaluation is domain-neutral and happens in two modes:
 
-| rule_id | trigger | severity |
+| mode | when | behaviour |
 | --- | --- | --- |
-| `require_asset_number` | CAPEX at/above the demo threshold with no asset number | block |
-| `capex_requires_capitalization` | Above-threshold purchase recorded as OPEX but with an asset number | warn |
+| structured | rule carries a `condition` object (e.g. `requires_fields`) | evaluated deterministically in Python |
+| natural language | rule is prose only | judged by the LLM; returns `unreviewed` when the LLM is unavailable |
+
+A rule id is generated per step, so `matched_rule_id` always links back to the exact step that
+defined it — that link is what `evidence` returns to the apprentice.
 
 The threshold and policy are demo data only.

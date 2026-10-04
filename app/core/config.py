@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     elevenlabs_agent_id: str = ""
     llm_api_key: str = ""
     llm_base_url: str = "https://api.anthropic.com"
-    llm_model: str = "claude-3-5-sonnet-latest"
+    llm_model: str = "claude-haiku-4-5"
     llm_workspace_id: str = ""
     extra_allowed_origins: str = ""
 

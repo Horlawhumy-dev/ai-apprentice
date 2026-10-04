@@ -14,7 +14,7 @@ def test_event_and_offrecord_rejection():
         json={
             "client_event_id": "123e4567-e89b-12d3-a456-426614174000",
             "timestamp_ms": 1000,
-            "source": "demo_erp",
+            "source": "ticketing_app",
             "type": "field_changed",
             "data": {},
         },

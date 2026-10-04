@@ -8,6 +8,63 @@ unseen cases. Implements the **Capture → Map → Teach** loop.
 > full-stack design and the server contract this API implements — they are not runnable here.
 > Everything else below is present and covered by tests.
 
+## Problem
+
+Expert tacit knowledge is undocumented and perishable. The person who knows why a cost center
+was chosen, when an invoice must be escalated, or which supplier history actually mattered is
+usually the only person who knows — and they are unavailable, or gone. New employees learn by
+shadowing, which is slow, inconsistent, and does not scale.
+
+The existing alternative is writing it down, which captures *procedure* but loses *judgment*:
+the reasoning behind a decision, the boundary where one rule stops applying, and the exception
+nobody documented. Recording a screen does not fix that either. A walkthrough video shows what
+happened, not what the expert was weighing.
+
+## Solution
+
+Capture the work as it happens, extract the decisions from it, then reuse those decisions to
+teach the same judgment on cases the learner has not seen. The loop is **Capture → Map → Teach**:
+
+- **Capture** — events and a transcript flow in from the expert's screen and voice. Off-record
+  is enforced server-side, so nothing is stored while it is switched off.
+- **Map** — the captured material becomes a work map: steps, decision points, and guardrails.
+  A model proposes the structure; a human confirms it.
+- **Teach** — the apprentice works unseen cases against that map. Guardrails are checked on
+  every action, and each decision is scored against what the expert actually did.
+
+The questions are the interesting part. Rather than replaying a fixed script, the policy service
+decides whether the current moment deserves a question at all, and asks about rationale,
+boundaries, guardrails, exceptions, and alternatives — grounded in the evidence captured for
+*that* workflow. It falls back to deterministic templates when no model is configured, so the
+loop still runs offline.
+
+## Architecture
+
+A single FastAPI service over PostgreSQL, three logical layers:
+
+```
+capture  ──▶  map  ──▶  teach
+ events      work map     cases
+ transcript  guardrails   attempts
+   │            │            │
+   └────────────┴────────────┘
+        QuestionPolicyService decides what to ask
+        Provider clients (Anthropic, ElevenLabs) sit behind the API
+```
+
+- **Routes** (`app/api/routes/`) are thin; they validate, delegate to a service, and shape the response.
+- **Services** (`app/services/`) hold the logic: session state, capture, work map, guardrails,
+  question policy, providers.
+- **Persistence** is SQLAlchemy models in `app/models/`, with a session-per-request dependency.
+
+Two deliberate choices. The question policy is server-side and deterministic-capable, so
+interview behaviour is reproducible and testable without network access. And provider keys stay
+on the server: the browser asks the backend for a short-lived ElevenLabs signed URL and never
+sees an API key.
+
+Full detail, including the event contract and state machine, is in
+[`architecture.md`](architecture.md).
+
 ## Stack
 
 - **API**: FastAPI, Pydantic v2, Pydantic Settings
@@ -79,9 +136,22 @@ All settings are read from the environment (or `.env`) via `app/core/config.py`.
 | `EXTRA_ALLOWED_ORIGINS` | *(empty)* | Comma-separated additional CORS origins |
 | `LLM_API_KEY` | *(empty)* | Blank ⇒ deterministic question policy, fully offline |
 | `LLM_BASE_URL` | `https://api.anthropic.com` | |
-| `LLM_MODEL` | `claude-3-5-sonnet-latest` | |
-| `ELEVENLABS_API_KEY` | *(empty)* | Blank ⇒ prototype transcript mode |
-| `ELEVENLABS_AGENT_ID` | *(empty)* | |
+| `LLM_MODEL` | `claude-haiku-4-5` | `claude-opus-4-5` also works, but see the timeout note |
+| `LLM_WORKSPACE_ID` | *(empty)* | Required when the key is not workspace-scoped |
+| `ELEVENLABS_API_KEY` | *(empty)* | Blank ⇒ voice is `unavailable`; the rest of the loop still works |
+| `ELEVENLABS_AGENT_ID` | *(empty)* | Conversational AI agent id; blank ⇒ `/api/voice/token` returns 503 |
+
+Two provider failure modes are worth knowing, because both fail *silently* into the
+deterministic fallback rather than erroring:
+
+- A key that is not workspace-scoped returns HTTP 400 unless `anthropic-workspace-id` is sent.
+  Set `LLM_WORKSPACE_ID` to that workspace's id.
+- Model availability is per key. If a model 404s for your key, the request still "succeeds"
+  as a fallback. Failures now log a warning and are reported per response as `source`, so
+  check `source: "deterministic"` before trusting a question.
+
+`llm.py` uses a 6s timeout. `claude-haiku-4-5` answers in roughly 1.3s and `claude-opus-4-5`
+in roughly 3.3s, so the latter fits but has little headroom on large debriefs.
 
 Tables are created on startup via `init_db()`; `make db-init` does the same on demand.
 
@@ -95,13 +165,17 @@ All routes are prefixed `/api`. Machine-readable schema at `/openapi.json`.
 | Session lifecycle | `POST /api/sessions`, `GET /api/sessions/{id}`, `POST .../start`, `.../capture/start`, `.../pause`, `.../resume`, `.../off-record`, `.../finish` |
 | Capture | `POST .../events`, `POST .../transcript` |
 | Interview | `POST .../questions/decide`, `POST .../debrief`, `POST .../questions/{question_id}/answer` |
+
+`decide` and `debrief` responses carry `source: "llm"` or `"deterministic"` so a client can
+tell a model-generated question from a fallback template. Fallback questions reference the
+session's `workflow_title` and never assert domain facts that were not observed in the events.
 | Map | `POST .../work-map/generate`, `GET /api/workflows/{id}`, `PATCH /api/workflows/{id}`, `PATCH /api/workflows/{id}/steps/{step_id}` |
 | Teach | `GET /api/apprentice/cases`, `GET /api/apprentice/cases/{case_id}`, `POST /api/apprentice/sessions`, `GET .../sessions/{id}`, `POST .../evaluate`, `POST .../finish` |
 | Voice | `POST /api/voice/token` |
 
-Transcript segments accept a constrained `source` of `voice_provider` or `prototype_transcript`;
-anything else is rejected with `422`. Event `source` stays free-form on purpose, since
-third-party apps instrumented via the capture SDK set their own.
+Transcript segments accept a constrained `source` of `voice_provider`; anything else is
+rejected with `422`. Event `source` stays free-form on purpose, since third-party apps
+instrumented via the capture SDK set their own.
 
 ### Session state machine
 
@@ -123,12 +197,14 @@ in the timeline, never content. `finish` is idempotent.
 ## Tests
 
 ```bash
-make test                         # 7 tests
+make test                         # 24 tests, no network or API keys needed
 make test-e2e                     # the full loop, off-record, idempotency
 ```
 
 `tests/test_e2e.py` covers the complete loop plus off-record rejection and finish idempotency.
-Tests force the deterministic question policy, so they need no API keys and no network.
+`tests/test_voice.py` covers the ElevenLabs token exchange and asserts the API key never appears in a
+response. `tests/test_question_policy.py` asserts the fallback never asserts domain facts it did not
+observe. Tests force the deterministic question policy, so they need no API keys and no network.
 
 ## Demo
 
@@ -136,13 +212,25 @@ Tests force the deterministic question policy, so they need no API keys and no n
 make run                         # in one shell
 ```
 
-Then follow [`demo-script.md`](demo-script.md), which walks the whole loop with `curl` + `jq`. Every
-command in it has been executed against a live server. Requires `jq`.
+There is no separate demo mode or seeded sample data: the running app *is* the demo. Drive it
+end to end like this:
+
+1. **Capture** — open the capture UI, name the workflow, and either speak through ElevenLabs or
+   instrument a real app with the capture SDK. Every `field_changed` / `decision` event you emit
+   becomes a candidate step.
+2. **Map** — `POST /api/sessions/{id}/work-map/generate`, then review in the UI and
+   `POST /api/workflows/{id}/confirm`. Steps are never confirmed automatically.
+3. **Teach** — open the apprentice UI, paste a confirmed work map's ID, and supply a *fresh* case
+   (an ID plus a JSON body). Nothing is blocked unless the expert confirmed a rule that the case
+   actually violates.
+
+```bash
+make test-e2e        # exercises all three stages against a throwaway database
+```
 
 ## Further reading
 
 - [`architecture.md`](architecture.md) — data flow, event contract, guardrails, provider integration
-- [`demo-script.md`](demo-script.md) — API-driven end-to-end walkthrough
 
 ## Deploying to Vercel
 

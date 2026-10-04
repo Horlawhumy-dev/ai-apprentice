@@ -24,7 +24,7 @@ class EventPayload(BaseModel):
     frame_id: Optional[str] = None
 
 
-TranscriptSource = Literal["voice_provider", "prototype_transcript"]
+TranscriptSource = Literal["voice_provider"]
 
 
 class TranscriptSegmentPayload(BaseModel):

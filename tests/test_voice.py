@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import settings
@@ -25,13 +26,21 @@ def _segment(source: str):
     }
 
 
-def test_voice_config_reports_prototype_when_unconfigured():
+@pytest.fixture(autouse=True)
+def _force_unconfigured(monkeypatch):
+    """These tests pin the not-configured branch, so they must not depend on the
+    developer's own .env. Without this they pass or fail based on local secrets."""
+    monkeypatch.setattr(settings, "elevenlabs_api_key", "")
+    monkeypatch.setattr(settings, "elevenlabs_agent_id", "")
+
+
+def test_voice_config_reports_unavailable_when_unconfigured():
     res = client.get("/api/voice/config")
     assert res.status_code == 200
     body = res.json()
     assert body["configured"] is False
-    assert body["provider"] == "prototype"
-    assert body["mode"] == "manual_transcript"
+    assert body["provider"] == "elevenlabs"
+    assert body["mode"] == "unavailable"
 
 
 def test_voice_config_never_exposes_agent_id_or_api_key():
@@ -45,19 +54,18 @@ def test_voice_token_is_503_when_unconfigured():
     assert res.status_code == 503
 
 
-def test_transcript_accepts_known_sources():
+def test_transcript_accepts_the_voice_provider_source():
     sid = _create_session()
     client.post(f"/api/sessions/{sid}/start")
-    for source in ("voice_provider", "prototype_transcript"):
-        res = client.post(f"/api/sessions/{sid}/transcript", json=_segment(source))
-        assert res.status_code == 200, source
-        assert res.json()["speaker"] == "expert"
+    res = client.post(f"/api/sessions/{sid}/transcript", json=_segment("voice_provider"))
+    assert res.status_code == 200
+    assert res.json()["speaker"] == "expert"
 
 
-def test_transcript_rejects_unknown_source():
+def test_transcript_rejects_a_source_that_is_not_the_voice_provider():
     sid = _create_session()
     client.post(f"/api/sessions/{sid}/start")
-    res = client.post(f"/api/sessions/{sid}/transcript", json=_segment("mystery_source"))
+    res = client.post(f"/api/sessions/{sid}/transcript", json=_segment("prototype_transcript"))
     assert res.status_code == 422
 
 
