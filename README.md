@@ -3,10 +3,9 @@
 API that captures expert workflows, maps decisions and guardrails, and teaches new employees through
 unseen cases. Implements the **Capture → Map → Teach** loop.
 
-> **Scope:** this repository currently contains the **FastAPI backend only**. The Next.js frontend is
-> not present. The browser UI and capture SDK documented in `architecture.md` describe the intended
-> full-stack design and the server contract this API implements — they are not runnable here.
-> Everything else below is present and covered by tests.
+> **Scope:** this repository is the **FastAPI backend**. The Next.js frontend lives in a separate
+> repository and is not present here; this API is the contract it builds against. The capture event
+> schema it consumes is documented in `architecture.md`.
 
 ## Problem
 
@@ -197,14 +196,34 @@ in the timeline, never content. `finish` is idempotent.
 ## Tests
 
 ```bash
-make test                         # 24 tests, no network or API keys needed
+make test                         # 52 tests, no network or API keys needed
 make test-e2e                     # the full loop, off-record, idempotency
 ```
 
 `tests/test_e2e.py` covers the complete loop plus off-record rejection and finish idempotency.
 `tests/test_voice.py` covers the ElevenLabs token exchange and asserts the API key never appears in a
 response. `tests/test_question_policy.py` asserts the fallback never asserts domain facts it did not
-observe. Tests force the deterministic question policy, so they need no API keys and no network.
+observe. `tests/test_question_grounding.py` asserts a model-generated question is discarded unless it
+cites a verbatim quote from the capture, which is what stops invented domain language ("approved",
+"amount") from reaching the user. `tests/test_workmap_reasoning.py` covers attaching spoken reasoning
+to the step it explains and rejecting filler like "Okay." Tests force the deterministic question
+policy, so they need no API keys and no network.
+
+## Grounding: nothing invented
+
+Two rules keep fabricated content out of the product, because a plausible-sounding invented question
+is worse than no question:
+
+- **Questions must cite evidence.** Every model-generated question carries an `evidence_quote` that
+  has to appear verbatim in the captured events and transcript. If it does not, the question is
+  dropped and the deterministic fallback is used instead. When nothing was captured, the corpus is
+  empty, so no question can be grounded and the model is not consulted at all.
+- **Spoken reasoning becomes the rule.** An expert's transcript is filed against the step they were on
+  as a guardrail, not as a separate `transcript_note` step. Filler ("Hmm?", "Okay.", "…") is filtered
+  out first, so guardrails are never built from noise.
+
+The work map therefore contains only what the expert did and said. There is no seeded workflow, and
+`GET /api/workflows/latest` returns the user's own most recent capture or `404`.
 
 ## Demo
 
