@@ -1,13 +1,19 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
 export function useScreenShare() {
   const [isSharing, setIsSharing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
-  async function startSharing() {
+  const stopSharing = useCallback(() => {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    setIsSharing(false);
+  }, []);
+
+  const startSharing = async () => {
     try {
       setError(null);
 
@@ -27,19 +33,7 @@ export function useScreenShare() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to share screen.");
     }
-  }
-
-  function stopSharing() {
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-    setIsSharing(false);
-  }
-
-  useEffect(() => {
-    return () => {
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-    };
-  }, []);
+  };
 
   return { isSharing, error, streamRef, startSharing, stopSharing };
 }
