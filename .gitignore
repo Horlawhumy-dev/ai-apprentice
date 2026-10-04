@@ -7,9 +7,20 @@ build/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+# Secrets: ignore every env variant, but keep the committed templates.
 .env
-.env.local
+.env.*
+!.env.example
 *.db
 .DS_Store
 coverage/
+htmlcov/
 venv/
+
+# Vercel build output and local project links
+.vercel/
+
+# Python packaging and tooling caches
+*.egg-info/
+.ruff_cache/
+.mypy_cache/

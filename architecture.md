@@ -2,8 +2,19 @@
 
 AI Apprentice implements the full loop: **Capture → Map → Teach**.
 
+## Scope
+
+This repository currently contains **the FastAPI backend only**. The Next.js frontend that the
+diagram below describes is not present. Sections covering browser routes, the capture SDK, and
+`NEXT_PUBLIC_API_URL` document the intended full-stack design and the contract the backend
+implements — they are not runnable from this repo as it stands.
+
+Everything under *Session state machine*, *Provider integration*, and *Guardrails* describes code
+that is present and covered by tests. `tests/test_e2e.py` exercises the whole Capture → Map →
+Teach loop against the API directly, without a browser.
+
 ```
-Browser (Next.js App Router)
+Browser (Next.js App Router) — NOT PRESENT IN THIS REPO
 ├── /                 landing
 ├── /expert           Expert Capture (screen share, pause, off-record, finish, debrief)
 ├── /demo-erp         Fictional invoice ERP that emits structured events
@@ -42,6 +53,10 @@ PostgreSQL (SQLAlchemy)
 `public/sdk/ai-apprentice-capture.js` is a dependency-free script any web app can include. It posts
 events with the session id supplied by the capture UI and gates emission on the server-side session
 status polled every few seconds, so Pause and Off Record stop telemetry from the real app too.
+
+> The SDK itself lived at `frontend/public/sdk/ai-apprentice-capture.js` and is **not present in this
+> repo**. The server-side contract it targets (`/api/sessions/{id}/events`, session-status gating) is
+> present and exercised by the tests.
 
 ```html
 <script src="http://localhost:3000/sdk/ai-apprentice-capture.js"
