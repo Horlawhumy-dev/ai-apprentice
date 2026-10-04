@@ -11,7 +11,7 @@ unseen cases. Implements the **Capture → Map → Teach** loop.
 ## Stack
 
 - **API**: FastAPI, Pydantic v2, Pydantic Settings
-- **Persistence**: SQLAlchemy 2, PostgreSQL (`psycopg2`)
+- **Persistence**: SQLAlchemy 2, PostgreSQL (`psycopg` v3, with `psycopg2` still supported)
 - **Optional providers**: ElevenLabs (voice), Anthropic Messages API (interviewer)
 - **Runtime**: Python 3.12
 
@@ -28,9 +28,16 @@ make venv                         # create venv/ and install requirements
 `DATABASE_URL` accepts a unix socket (peer auth) or a full TCP URL:
 
 ```
-postgresql+psycopg2:///ai_apprentice
-postgresql+psycopg2://postgres:postgres@localhost:5432/ai_apprentice
+postgresql:///ai_apprentice
+postgresql://postgres:postgres@localhost:5432/ai_apprentice
 ```
+
+Driver caveat, which is easy to get wrong: under SQLAlchemy 2.x a bare `postgresql://`
+URL resolves to the **psycopg v3** driver, not psycopg2. If `psycopg` is not installed you
+get `ModuleNotFoundError: No module named 'psycopg'` at import time, before the app can
+serve a request. Both drivers are installed, so `postgresql://`, `postgresql+psycopg://`
+and `postgresql+psycopg2://` all work. Hosted providers (Neon, Supabase) hand you a bare
+`postgresql://` URL, so use that form and you avoid the question entirely.
 
 ## Run
 
@@ -90,6 +97,11 @@ All routes are prefixed `/api`. Machine-readable schema at `/openapi.json`.
 | Interview | `POST .../questions/decide`, `POST .../debrief`, `POST .../questions/{question_id}/answer` |
 | Map | `POST .../work-map/generate`, `GET /api/workflows/{id}`, `PATCH /api/workflows/{id}`, `PATCH /api/workflows/{id}/steps/{step_id}` |
 | Teach | `GET /api/apprentice/cases`, `GET /api/apprentice/cases/{case_id}`, `POST /api/apprentice/sessions`, `GET .../sessions/{id}`, `POST .../evaluate`, `POST .../finish` |
+| Voice | `POST /api/voice/token` |
+
+Transcript segments accept a constrained `source` of `voice_provider` or `prototype_transcript`;
+anything else is rejected with `422`. Event `source` stays free-form on purpose, since
+third-party apps instrumented via the capture SDK set their own.
 
 ### Session state machine
 

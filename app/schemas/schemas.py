@@ -24,12 +24,15 @@ class EventPayload(BaseModel):
     frame_id: Optional[str] = None
 
 
+TranscriptSource = Literal["voice_provider", "prototype_transcript"]
+
+
 class TranscriptSegmentPayload(BaseModel):
     segment_id: str
     timestamp_ms: int
     speaker: str
     text: str
-    source: str
+    source: TranscriptSource
 
 
 class Guardrail(BaseModel):

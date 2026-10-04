@@ -102,9 +102,13 @@ captured content. `finish` is idempotent.
 
 ## Provider integration
 
-- **Voice**: `/api/voice/config` reports whether ElevenLabs is configured. When it is, the backend
-  exposes the agent id and the browser can connect with a short-lived token. When it is not, the UI
-  runs in clearly-labelled prototype transcript mode so the rest of the loop is demonstrable.
+- **Voice**: `/api/voice/config` reports whether ElevenLabs is configured. When it is, the browser
+  calls `POST /api/voice/token`, and the backend exchanges its API key for a short-lived signed
+  WebSocket URL (valid ~15 minutes) via ElevenLabs' `get-signed-url`. The API key and the raw
+  agent id never leave the server. When ElevenLabs is not configured, the endpoint returns `503`
+  and the UI runs in clearly-labelled prototype transcript mode so the rest of the loop stays
+  demonstrable. Transcript segments carry a constrained `source`
+  (`voice_provider` | `prototype_transcript`) so provenance stays queryable.
 - **Interviewer (LLM)**: `QuestionPolicyService` is model-driven when `LLM_API_KEY` is set. It sends
   recent events + transcript + session state + remaining budget to the Anthropic Messages API and
   expects a validated `{should_ask, question_type, question, trigger_event_id, rationale_for_internal_logging}`

@@ -1,16 +1,27 @@
-from fastapi import APIRouter
+import httpx
+from fastapi import APIRouter, HTTPException
 
-from app.core.config import settings
+from app.services import voice_service
 
 router = APIRouter(prefix="/voice", tags=["Voice"])
 
 
 @router.get("/config")
 def voice_config():
-    configured = bool(settings.elevenlabs_api_key and settings.elevenlabs_agent_id)
+    configured = voice_service.is_configured()
     return {
         "provider": "elevenlabs" if configured else "prototype",
         "configured": configured,
-        "agent_id": settings.elevenlabs_agent_id if configured else None,
-        "mode": "realtime" if configured else "manual_transcript",
+        "mode": "signed_url" if configured else "manual_transcript",
     }
+
+
+@router.post("/token")
+async def voice_token():
+    if not voice_service.is_configured():
+        raise HTTPException(status_code=503, detail="Voice provider is not configured")
+    try:
+        signed_url = await voice_service.mint_signed_url()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Voice provider request failed: {exc}") from exc
+    return {"signed_url": signed_url, "expires_in": voice_service.SIGNED_URL_TTL_SECONDS}
