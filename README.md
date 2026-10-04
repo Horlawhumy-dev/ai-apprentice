@@ -1,4 +1,4 @@
-# AI Apprentice — Backend
+# AI Apprentice System
 
 API that captures expert workflows, maps decisions and guardrails, and teaches new employees through
 unseen cases. Implements the **Capture → Map → Teach** loop.
